@@ -3,20 +3,28 @@ using Discord.Net;
 using Discord.WebSocket;
 using OpenAI;
 using OpenAI.Chat;
+using OpenAI.Images;
 using OpenAI.Realtime;
 using OpenAI.Responses;
 using OpenAI.VectorStores;
 using System;
 using System.ClientModel;
 using System.ClientModel.Primitives;
+using System.Collections;
 using System.Collections.Generic;
 using System.ComponentModel.Design;
 using System.Diagnostics;
+using System.Drawing;
+using System.IO;
 using System.Linq;
+using System.Net;
+using System.Net.Http;
 using System.Net.Mail;
 using System.Text;
+using System.Text.Json;
 using System.Threading;
 using System.Threading.Tasks;
+using System.Windows.Forms;
 
 
 #pragma warning disable OPENAI001
@@ -28,7 +36,106 @@ namespace JimmieBot_CSharpService
         private static DiscordSocketClient dClient;
         private static OpenAIClient OAIClient;
         private static ChatClient CClient;
+        private static ChatTool ImageInPaint;
 
+        public async static void InPaintImage(ChatToolCall toolCall, SocketUserMessage message, IMessage replyMessage)
+        {
+            JsonDocument argJson = JsonDocument.Parse(toolCall.FunctionArguments);
+            String editInstructions = argJson.RootElement.GetProperty("editInstructions").GetString();
+            List<Uri> imageUris = new List<Uri>();
+
+            // Put all the image URLs into a  list to pass them over
+            foreach (Discord.Attachment attachment in message.Attachments)
+            {
+                if (attachment.ContentType != null && (attachment.ContentType.StartsWith("image/")))
+                {
+                    Uri uri;
+                    if (Uri.TryCreate(attachment.Url, UriKind.Absolute, out uri))
+                    {
+                        imageUris.Add(uri);
+                    }
+                }
+            }
+            if (replyMessage != null)
+            {
+                foreach (Discord.Attachment attachment in replyMessage.Attachments)
+                {
+                    if (attachment.ContentType != null && (attachment.ContentType.StartsWith("image/")))
+                    {
+                        Uri uri;
+                        if (Uri.TryCreate(attachment.Url, UriKind.Absolute, out uri))
+                        {
+                            imageUris.Add(uri);
+                        }
+                    }
+                }
+            }
+            if (imageUris.Count == 0)
+            {
+                await message.ReplyAsync(text: "No images were detected attached");
+                return;
+            }
+
+            IUserMessage botReply = await message.ReplyAsync("Working on it...");
+
+            // Download the attachment to a temporary location, and then pass the file path to the image edit endpoint.
+            HttpClient httpClient = new HttpClient();
+            //List<Stream> imageDownloadStreams = new List<Stream>(); // await httpClient.GetStreamAsync(imageUris[0]);
+            //await imageDownloadStream.CopyToAsync(imageDownloadMemoryStream);
+            
+            var formData = new MultipartFormDataContent();
+            formData.Add(new StringContent("chatgpt-image-latest"), "model");
+            formData.Add(new StringContent("low"), "moderation");
+            formData.Add(new StringContent("high"), "input_fidelity");
+            formData.Add(new StringContent("output_format"), "png");
+
+            //Try running it with a straight HTTP request
+            httpClient.DefaultRequestHeaders.Add("Authorization", $"Bearer {RegConfig.GetConfig(RegConfigItems.OpenAIToken, "NULL").ToString()}");
+            int i = 0;
+            foreach (Uri uri in imageUris)
+            {
+                Stream imageDownloadStream = await httpClient.GetStreamAsync(uri);
+                MemoryStream tempMemStream = new MemoryStream();
+                await imageDownloadStream.CopyToAsync(tempMemStream);
+                tempMemStream.Position = 0;
+
+                formData.Add(
+                    new StreamContent(tempMemStream),
+                    "image[]",
+                    $"user_content_{i}.png"
+                );
+                i++;
+            }
+
+            formData.Add(new StringContent(editInstructions), "prompt");
+
+            String formAsString = await formData.ReadAsStringAsync();
+
+            HttpResponseMessage APICallResuilt = await httpClient.PostAsync("https://api.openai.com/v1/images/edits", formData);
+
+            if (APICallResuilt.IsSuccessStatusCode)
+            {
+                String responseString = await APICallResuilt.Content.ReadAsStringAsync();
+                var jsonData = JsonDocument.Parse(responseString);
+                var base64Image = jsonData.RootElement
+                                .GetProperty("data")[0]
+                                .GetProperty("b64_json")
+                                .GetString();
+
+                byte[] imageBytes = Convert.FromBase64String(base64Image);
+
+                //await message.Channel.SendFileAsync(new MemoryStream(imageBytes), $"edited_image_{message.Id.ToString()}.png");
+                await botReply.ModifyAsync(msg =>
+                {
+                    msg.Content = "";
+                    msg.Attachments = new Optional<IEnumerable<FileAttachment>>(new List<FileAttachment> { new FileAttachment(new MemoryStream(imageBytes), $"edited_image_{message.Id.ToString()}.png") });
+                });
+            }
+            else
+            {
+                await message.ReplyAsync(text: $"API call failed with status code {APICallResuilt.StatusCode} and response:\n{await APICallResuilt.Content.ReadAsStringAsync()}");
+            }
+        }
         public static async Task Start(CancellationToken ct)
         {
 #if DEBUG
@@ -47,6 +154,11 @@ namespace JimmieBot_CSharpService
             {
                 GatewayIntents = GatewayIntents.AllUnprivileged | GatewayIntents.MessageContent
             };
+
+            // Init our Chat Tool(s)
+            ImageInPaint = ChatTool.CreateFunctionTool(nameof(InPaintImage),
+                "Edit the attached image based on the provided instructions.",
+                BinaryData.FromBytes(Encoding.UTF8.GetBytes("{\"type\":\"object\",\"properties\":{\"editInstructions\":{\"type\":\"string\",\"description\":\"The changes the user requested to make to the image\"}}}")));
 
             dClient = new DiscordSocketClient(config);
 
@@ -173,6 +285,39 @@ namespace JimmieBot_CSharpService
                 await LoggingHandler.LogAsync($"Failed to build slash command: {ex.Message}", EventLogEntryType.Error);
             }
 
+            try
+            {
+                var getPromptCommand = new SlashCommandBuilder();
+                getPromptCommand.WithName("getprompt");
+                getPromptCommand.WithDescription("Get the current instructions prompt that the AI is using.");
+                await dClient.CreateGlobalApplicationCommandAsync(getPromptCommand.Build());
+            }
+            catch (HttpException e)
+            {
+                await LoggingHandler.LogAsync($"Failed to create slash command: {e.Message}", EventLogEntryType.Error);
+            }
+            catch (Exception ex)
+            {
+                await LoggingHandler.LogAsync($"Failed to build slash command: {ex.Message}", EventLogEntryType.Error);
+            }
+
+            try
+            {
+                var setPromptComand = new SlashCommandBuilder();
+                setPromptComand.WithName("setprompt");
+                setPromptComand.WithDescription("Set the instructions prompt that the AI uses.");
+                setPromptComand.AddOption("prompt", ApplicationCommandOptionType.String, "The instructions prompt to use for the AI.", isRequired: true);
+                await dClient.CreateGlobalApplicationCommandAsync(setPromptComand.Build());
+            }
+            catch (HttpException e)
+            {
+                await LoggingHandler.LogAsync($"Failed to create slash command: {e.Message}", EventLogEntryType.Error);
+            }
+            catch (Exception ex)
+            {
+                await LoggingHandler.LogAsync($"Failed to build slash command: {ex.Message}", EventLogEntryType.Error);
+            }
+
 
             dClient.SlashCommandExecuted += SlashCommandHandler;
         }
@@ -189,6 +334,12 @@ namespace JimmieBot_CSharpService
                     break;
                 case "time":
                     await timeCommand_Handler(command);
+                    break;
+                case "getprompt":
+                    await getPrompt_Handler(command);
+                    break;
+                case "setprompt":
+                    await setPrompt_Handler(command);
                     break;
                 default:
                     await command.RespondAsync($"Unknown command: {command.Data.Name}", ephemeral: true);
@@ -259,6 +410,45 @@ namespace JimmieBot_CSharpService
                 RegConfig.SetConfig(RegConfigItems.AllowedAIChannels, newAllowedChannelsConfig);
                 await command.RespondAsync("Done!", ephemeral: true);
             }
+        }
+
+        public static async Task getPrompt_Handler(SocketSlashCommand command)
+        {
+            var user = command.User as SocketGuildUser;
+            if (user == null)
+            {
+                return;
+            }
+            if (!user.GuildPermissions.Administrator)
+            {
+                await command.RespondAsync("You must be an administrator to use this command.", ephemeral: true);
+                return;
+            }
+
+            await command.RespondAsync(RegConfig.GetConfig(RegConfigItems.ModelInstructions, defaultInstructions).ToString(), ephemeral: true);
+        }
+
+        public static async Task setPrompt_Handler(SocketSlashCommand command)
+        {
+            var user = command.User as SocketGuildUser;
+            if (user == null)
+            {
+                return;
+            }
+            if (!user.GuildPermissions.Administrator)
+            {
+                await command.RespondAsync("You must be an administrator to use this command.", ephemeral: true);
+                return;
+            }
+            var promptOption = command.Data.Options.FirstOrDefault(opt => opt.Name == "prompt");
+            if (promptOption == null || promptOption.Value == null)
+            {
+                await command.RespondAsync("You must provide a valid prompt string.", ephemeral: true);
+                return;
+            }
+            String promptString = promptOption.Value.ToString();
+            RegConfig.SetConfig(RegConfigItems.ModelInstructions, promptString);
+            await command.RespondAsync("Done!", ephemeral: true);
         }
 
         public static async Task timeCommand_Handler(SocketSlashCommand command)
@@ -481,6 +671,8 @@ namespace JimmieBot_CSharpService
             options.EndUserId = message.Author.ToString();
             options.MaxOutputTokenCount = 8196; // I don't want it writing infinite fucking essays
             //options.ToolChoice = ChatToolChoice.CreateNoneChoice();
+            options.Tools.Add(ImageInPaint);
+
 
             // Send it to OpenAI
             try
@@ -489,7 +681,9 @@ namespace JimmieBot_CSharpService
 
                 if (aiResult.Value.FinishReason != ChatFinishReason.ContentFilter)
                 {
-                    // Cut our response into >2000 length sized chunks for Discord
+                    if (aiResult.Value.FinishReason == ChatFinishReason.Stop)
+                    {
+                        // Cut our response into >2000 length sized chunks for Discord
 #if DEBUG
                     if (aiResult.Value.Content.Count > 1)
                     {
@@ -497,17 +691,33 @@ namespace JimmieBot_CSharpService
                     }
 #endif
 
-                    // Since we have a response and the message, add to our history before we write it back.
-                    ChatHistoryManager.AddChatMessageHistoryItem(message.Author.Id, new ChatMessageHistoryItem(DateTime.Now, message.Content, message.Author.Id, ChatMessageHistoryType.User));
+                        // Since we have a response and the message, add to our history before we write it back.
+                        ChatHistoryManager.AddChatMessageHistoryItem(message.Author.Id, new ChatMessageHistoryItem(DateTime.Now, message.Content, message.Author.Id, ChatMessageHistoryType.User));
 
-                    // Also add the response
-                    ChatHistoryManager.AddChatMessageHistoryItem(message.Author.Id, new ChatMessageHistoryItem(DateTime.Now, aiResult.Value.Content[0].Text, dClient.CurrentUser.Id, ChatMessageHistoryType.Assistant));
+                        // Also add the response
+                        ChatHistoryManager.AddChatMessageHistoryItem(message.Author.Id, new ChatMessageHistoryItem(DateTime.Now, aiResult.Value.Content[0].Text, dClient.CurrentUser.Id, ChatMessageHistoryType.Assistant));
 
-                    List<String> messageChunks = BreakStringIntoChunks(aiResult.Value.Content[0].Text);
-                    foreach (String chunk in messageChunks)
+                        List<String> messageChunks = BreakStringIntoChunks(aiResult.Value.Content[0].Text);
+                        foreach (String chunk in messageChunks)
+                        {
+                            await message.ReplyAsync(text: chunk);
+                            await Task.Delay(100); // Just for rate limiting
+                        }
+                    } 
+                    else if (aiResult.Value.FinishReason == ChatFinishReason.ToolCalls)
                     {
-                        await message.ReplyAsync(text: chunk);
-                        await Task.Delay(100); // Just for rate limiting
+                        foreach (ChatToolCall toolCall in aiResult.Value.ToolCalls)
+                        {
+                            switch (toolCall.FunctionName)
+                            {
+                                case nameof(InPaintImage):
+                                    InPaintImage(toolCall, message, replyMessage);
+                                    break;
+                                default:
+                                    await LoggingHandler.LogAsync($"Received call for unknown tool: {toolCall.FunctionName}", EventLogEntryType.Error);
+                                    break;
+                            }
+                        }
                     }
                 }
                 else
