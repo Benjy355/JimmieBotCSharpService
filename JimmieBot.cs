@@ -84,13 +84,11 @@ namespace JimmieBot_CSharpService
             //await imageDownloadStream.CopyToAsync(imageDownloadMemoryStream);
             
             var formData = new MultipartFormDataContent();
-            formData.Add(new StringContent("chatgpt-image-latest"), "model");
-            formData.Add(new StringContent("low"), "moderation");
-            formData.Add(new StringContent("high"), "input_fidelity");
-            formData.Add(new StringContent("output_format"), "png");
+            formData.Add(new StringContent("gpt-image-2"), "model");
 
             //Try running it with a straight HTTP request
             httpClient.DefaultRequestHeaders.Add("Authorization", $"Bearer {RegConfig.GetConfig(RegConfigItems.OpenAIToken, "NULL").ToString()}");
+            httpClient.Timeout = TimeSpan.FromMinutes(15);
             int i = 0;
             foreach (Uri uri in imageUris)
             {
@@ -111,11 +109,28 @@ namespace JimmieBot_CSharpService
 
             String formAsString = await formData.ReadAsStringAsync();
 
-            HttpResponseMessage APICallResuilt = await httpClient.PostAsync("https://api.openai.com/v1/images/edits", formData);
+            HttpResponseMessage APICallResult;
 
-            if (APICallResuilt.IsSuccessStatusCode)
+            try
             {
-                String responseString = await APICallResuilt.Content.ReadAsStringAsync();
+                APICallResult = await httpClient.PostAsync("https://api.openai.com/v1/images/edits", formData);
+            } catch (TaskCanceledException e)
+            {
+                await botReply.ModifyAsync(msg =>
+                {
+                    msg.Content = "The image edit took too long and timed out.";
+                });
+                return;
+            }
+
+            if (APICallResult == null)
+            {
+                return;
+            }
+
+            if (APICallResult.IsSuccessStatusCode)
+            {
+                String responseString = await APICallResult.Content.ReadAsStringAsync();
                 var jsonData = JsonDocument.Parse(responseString);
                 var base64Image = jsonData.RootElement
                                 .GetProperty("data")[0]
@@ -133,7 +148,7 @@ namespace JimmieBot_CSharpService
             }
             else
             {
-                await message.ReplyAsync(text: $"API call failed with status code {APICallResuilt.StatusCode} and response:\n{await APICallResuilt.Content.ReadAsStringAsync()}");
+                await message.ReplyAsync(text: $"API call failed with status code {APICallResult.StatusCode} and response:\n{await APICallResult.Content.ReadAsStringAsync()}");
             }
         }
         public static async Task Start(CancellationToken ct)
@@ -158,7 +173,7 @@ namespace JimmieBot_CSharpService
             // Init our Chat Tool(s)
             ImageInPaint = ChatTool.CreateFunctionTool(nameof(InPaintImage),
                 "Edit the attached image based on the provided instructions.",
-                BinaryData.FromBytes(Encoding.UTF8.GetBytes("{\"type\":\"object\",\"properties\":{\"editInstructions\":{\"type\":\"string\",\"description\":\"The changes the user requested to make to the image\"}}}")));
+                BinaryData.FromBytes(Encoding.UTF8.GetBytes("{\"type\":\"object\",\"properties\":{\"editInstructions\":{\"type\":\"string\",\"description\":\"The changes the user requested to make to the image. DO NOT PARAPHRASE\"}}}")));
 
             dClient = new DiscordSocketClient(config);
 

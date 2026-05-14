@@ -5,7 +5,7 @@
     <Configuration Condition=" '$(Configuration)' == '' ">Debug</Configuration>
     <Platform Condition=" '$(Platform)' == '' ">AnyCPU</Platform>
     <ProjectGuid>{8B4091F6-BE31-4D04-9991-D9BD03854247}</ProjectGuid>
-    <OutputType>Exe</OutputType>
+    <OutputType>WinExe</OutputType>
     <RootNamespace>JimmieBot_CSharpService</RootNamespace>
     <AssemblyName>JimmieBot_CSharpService</AssemblyName>
     <TargetFrameworkVersion>v4.8</TargetFrameworkVersion>
